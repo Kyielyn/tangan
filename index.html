@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#090d12">
+<title>AI Hand Gesture</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#090d12;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.app{max-width:900px;margin:auto;padding:18px 14px 28px}h1{margin:0;font-size:27px}.sub{color:#9ba7b5;margin:5px 0 16px}
+.stage{position:relative;width:100%;aspect-ratio:4/3;border-radius:20px;overflow:hidden;background:#151b23;border:1px solid #26303b}
+video,canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}video{transform:scaleX(-1)}
+canvas{pointer-events:none}.badge{position:absolute;top:12px;left:12px;right:12px;display:flex;justify-content:space-between;gap:8px}
+.pill{padding:9px 12px;border-radius:999px;background:#0009;backdrop-filter:blur(8px);font-size:13px}.gesture{font-size:20px;font-weight:800}
+.controls{display:flex;gap:10px;margin-top:13px}button{flex:1;border:0;border-radius:14px;padding:14px;font-size:16px;font-weight:750;background:#fff;color:#111}button:disabled{opacity:.45}button.secondary{background:#202833;color:#fff}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:13px}.card{background:#151b23;border:1px solid #26303b;border-radius:14px;padding:11px;text-align:center}.emoji{font-size:25px}.name{font-size:12px;color:#aeb8c4;margin-top:3px}
+.tip{color:#8f9baa;font-size:12px;line-height:1.5;margin-top:14px}@media(max-width:500px){.grid{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<main class="app">
+<h1>AI Hand Gesture</h1>
+<p class="sub">Pinch • Fist • Open Palm • Thumbs Up</p>
+<div class="stage">
+<video id="video" autoplay playsinline muted></video><canvas id="canvas"></canvas>
+<div class="badge"><div class="pill" id="status">Kamera belum aktif</div><div class="pill gesture" id="gesture">—</div></div>
+</div>
+<div class="controls"><button id="start">Nyalakan Kamera</button><button id="stop" class="secondary" disabled>Matikan</button></div>
+<div class="grid">
+<div class="card"><div class="emoji">🤏</div><div class="name">Pinch</div></div>
+<div class="card"><div class="emoji">✊</div><div class="name">Fist</div></div>
+<div class="card"><div class="emoji">🖐️</div><div class="name">Open Palm</div></div>
+<div class="card"><div class="emoji">👍</div><div class="name">Thumbs Up</div></div>
+</div>
+<p class="tip">Untuk Android/iOS, buka melalui HTTPS dan izinkan kamera. Internet diperlukan saat pertama kali memuat model AI.</p>
+</main>
+
+<script type="module">
+let FilesetResolver,HandLandmarker,DrawingUtils;
+const video=document.getElementById("video"),canvas=document.getElementById("canvas"),ctx=canvas.getContext("2d");
+const start=document.getElementById("start"),stop=document.getElementById("stop"),status=document.getElementById("status"),gestureEl=document.getElementById("gesture");
+let stream=null,landmarker=null,raf=0,lastTime=-1;
+
+const dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+const angle=(a,b,c)=>{
+  const ab={x:a.x-b.x,y:a.y-b.y},cb={x:c.x-b.x,y:c.y-b.y};
+  const dot=ab.x*cb.x+ab.y*cb.y;
+  return Math.acos(Math.max(-1,Math.min(1,dot/(Math.hypot(ab.x,ab.y)*Math.hypot(cb.x,cb.y))))) * 180/Math.PI;
+};
+function fingers(l){
+  // Landmark indices: thumb 4, index 8, middle 12, ring 16, pinky 20
+  return [
+    angle(l[2],l[3],l[4])>150 && dist(l[4],l[0])>dist(l[3],l[0])*1.12,
+    angle(l[5],l[6],l[8])>155,
+    angle(l[9],l[10],l[12])>155,
+    angle(l[13],l[14],l[16])>155,
+    angle(l[17],l[18],l[20])>155
+  ];
+}
+function classify(l){
+  const f=fingers(l), open=f.filter(Boolean).length;
+  const pinch=dist(l[4],l[8]) < 0.075;
+  if(pinch) return ["🤏 Pinch", "PINCH"];
+  // Thumb up: thumb extended, other four folded, thumb tip substantially above wrist
+  const thumbUp=f[0] && !f[1]&&!f[2]&&!f[3]&&!f[4] && l[4].y < l[3].y-0.04;
+  if(thumbUp) return ["👍 Thumbs Up","THUMBS UP"];
+  if(open===0) return ["✊ Fist","FIST"];
+  if(open>=4) return ["🖐️ Open Palm","OPEN PALM"];
+  return ["✋ Hand","HAND"];
+}
+function setStatus(t){status.textContent=t}
+
+async function load(){
+  const m=await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/+esm");
+  ({FilesetResolver,HandLandmarker,DrawingUtils}=m);
+  const vision=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm");
+  landmarker=await HandLandmarker.createFromOptions(vision,{
+    baseOptions:{
+      modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate:"GPU"
+    },runningMode:"VIDEO",numHands:2,
+    minHandDetectionConfidence:.5,minHandPresenceConfidence:.5,minTrackingConfidence:.5
+  });
+}
+async function startCamera(){
+  try{
+    start.disabled=true;setStatus("Memuat AI…");
+    if(!landmarker)await load();
+    setStatus("Meminta izin kamera…");
+    stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:"user",width:{ideal:1280},height:{ideal:720}}});
+    video.srcObject=stream;await video.play();
+    canvas.width=video.videoWidth;canvas.height=video.videoHeight;
+    stop.disabled=false;setStatus("Kamera aktif");loop();
+  }catch(e){
+    console.error(e);start.disabled=false;stop.disabled=true;
+    setStatus(e.name==="NotAllowedError"?"Izin kamera ditolak":e.name==="NotFoundError"?"Kamera tidak ditemukan":"Gagal: "+e.name);
+  }
+}
+function loop(){
+  if(!stream)return;
+  if(video.currentTime!==lastTime){
+    lastTime=video.currentTime;
+    const r=landmarker.detectForVideo(video,performance.now());
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    const d=new DrawingUtils(ctx);
+    let labels=[];
+    r.landmarks.forEach(l=>{
+      d.drawConnectors(l,HandLandmarker.HAND_CONNECTIONS,{color:"#00ff9d",lineWidth:4});
+      d.drawLandmarks(l,{color:"#fff",fillColor:"#00ff9d",radius:4});
+      labels.push(classify(l)[0]);
+    });
+    gestureEl.textContent=labels.length?labels.join(" • "):"—";
+  }
+  raf=requestAnimationFrame(loop);
+}
+function stopCamera(){
+  cancelAnimationFrame(raf);if(stream)stream.getTracks().forEach(t=>t.stop());
+  stream=null;video.srcObject=null;ctx.clearRect(0,0,canvas.width,canvas.height);
+  start.disabled=false;stop.disabled=true;setStatus("Kamera berhenti");gestureEl.textContent="—";
+}
+start.onclick=startCamera;stop.onclick=stopCamera;window.addEventListener("pagehide",stopCamera);
+</script>
+</body>
+</html>
